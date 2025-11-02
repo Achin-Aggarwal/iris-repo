@@ -1,70 +1,85 @@
-name: CI-CD to GKE
+name: CI/CD - IRIS API to GKE
 
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch:
+    branches:
+      - main
 
 env:
-  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-  REGION: ${{ secrets.GCP_REGION }}
-  REPO_NAME: iris-repo
   IMAGE_NAME: iris-api
-  IMAGE_URI: ${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT_ID }}/iris-repo/iris-api
-  GKE_CLUSTER: ${{ secrets.GKE_CLUSTER }}
-  GKE_LOCATION: ${{ secrets.GKE_LOCATION }}
 
 jobs:
-  build-push-deploy:
+  build-deploy:
+    name: Build, Push, and Deploy to GKE
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      # ------------------------------
+      # 1️⃣ Checkout the repo
+      # ------------------------------
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # -------- Authenticate to GCP with key (exam/simple path) --------
-      - name: Setup gcloud
+      # ------------------------------
+      # 2️⃣ Authenticate to Google Cloud
+      # ------------------------------
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Google Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
         with:
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-          export_default_credentials: true
+          project_id: ${{ secrets.GCP_PROJECT }}
+          install_components: "gke-gcloud-auth-plugin"
 
-      # -------- Configure Docker to use Artifact Registry --------
-      - name: Configure Docker auth for Artifact Registry
-        run: gcloud auth configure-docker $REGION-docker.pkg.dev --quiet
+      # ------------------------------
+      # 3️⃣ Configure Docker for Artifact Registry
+      # ------------------------------
+      - name: Configure Docker
+        run: |
+          gcloud auth configure-docker ${{ secrets.GCP_REGION }}-docker.pkg.dev --quiet
 
-      # -------- Build and push docker image --------
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.IMAGE_URI }}:${{ github.sha }}
-            ${{ env.IMAGE_URI }}:latest
+      # ------------------------------
+      # 4️⃣ Build and push Docker image
+      # ------------------------------
+      - name: Build and Push Docker image
+        id: build
+        run: |
+          IMAGE="${{ secrets.GCP_REGION }}-docker.pkg.dev/${{ secrets.GCP_PROJECT }}/${{ secrets.GCP_AR_REPO }}/${{ env.IMAGE_NAME }}"
+          TAG=$(echo $GITHUB_SHA | cut -c1-7)
+          docker build -t $IMAGE:$TAG -t $IMAGE:latest .
+          docker push $IMAGE:$TAG
+          docker push $IMAGE:latest
+          echo "image=$IMAGE:$TAG" >> $GITHUB_OUTPUT
 
-      # -------- Get GKE credentials for kubectl --------
+      # ------------------------------
+      # 5️⃣ Get GKE credentials
+      # ------------------------------
       - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: ${{ secrets.GCP_GKE_CLUSTER }}
+          location: ${{ secrets.GCP_GKE_LOCATION }}
+          project_id: ${{ secrets.GCP_PROJECT }}
+
+      # ------------------------------
+      # 6️⃣ Deploy to Kubernetes
+      # ------------------------------
+      - name: Deploy to GKE
         run: |
-          gcloud container clusters get-credentials "$GKE_CLUSTER" --region "$GKE_LOCATION" --project "$PROJECT_ID" || \
-          gcloud container clusters get-credentials "$GKE_CLUSTER" --zone "$GKE_LOCATION" --project "$PROJECT_ID"
+          kubectl -n ${{ secrets.K8S_NAMESPACE }} set image deployment/iris-api iris-api-container=${{ steps.build.outputs.image }}
+          kubectl -n ${{ secrets.K8S_NAMESPACE }} rollout status deployment/iris-api
 
-      # -------- Create namespace (idempotent) --------
-      - name: Apply namespace
-        run: kubectl apply -f k8s/namespace.yaml
-
-      # -------- Apply manifests with a placeholder image, then set the new image tag --------
-      - name: Apply Deployment & Service
+      # ------------------------------
+      # 7️⃣ (Optional) Verify health endpoint
+      # ------------------------------
+      - name: Verify Deployment Health
         run: |
-          # Replace placeholder image in-memory and apply
-          sed "s|REPLACEME_IMAGE_URI|${IMAGE_URI}:${GITHUB_SHA}|g" k8s/deployment.yaml | kubectl apply -f -
-          kubectl apply -f k8s/service.yaml
+          echo "Checking /health endpoint..."
+          sleep 20
+          EXTERNAL_IP=$(kubectl -n ${{ secrets.K8S_NAMESPACE }} get svc iris-api -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Service External IP: $EXTERNAL_IP"
+          curl -f http://$EXTERNAL_IP/health
 
-      # -------- Verify rollout --------
-      - name: Wait for rollout
-        run: kubectl -n iris rollout status deploy/iris-api --timeout=180s
-
-      # -------- Show service external IP (if available) --------
-      - name: Get Service External IP
-        run: kubectl -n iris get svc iris-api-svc -o wide
